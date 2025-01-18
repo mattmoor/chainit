@@ -120,8 +120,10 @@ func main() {
 		eth0 = link
 		break
 	}
+	skipNetworking := false
 	if eth0 == nil {
-		log.Panicf("no suitable interface found to listen on")
+		log.Printf("no suitable interface found to listen on, skipping networking")
+		skipNetworking = true
 	} else if err := netlink.LinkSetUp(eth0); err != nil {
 		log.Panicf("failed to set network interface %s up: %v", eth0.Attrs().Name, err)
 	}
@@ -129,7 +131,7 @@ func main() {
 	// Configure DHCP for eth0
 	// Modeled after the u-root configureAll function:
 	// https://github.com/u-root/u-root/blob/0c0df672/cmds/core/dhclient/dhclient.go#L67
-	{
+	if !skipNetworking {
 		c := dhclient.Config{
 			Timeout: 10 * time.Second,
 			Retries: 3,
