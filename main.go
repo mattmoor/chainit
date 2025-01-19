@@ -45,44 +45,14 @@ func shutdown() {
 
 const defaultPath = "/sbin:/usr/sbin:/bin:/usr/bin:/usr/local/sbin:/usr/local/bin"
 
-func main() {
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
-	defer cancel()
-
-	// mount -t proc proc -o nodev,nosuid,hidepid=2 /proc
-	if err := mount.Mount("proc", "/proc", "proc", "nodev,nosuid,hidepid=2"); err != nil {
-		log.Printf("failed to mount: %v", err)
-	}
-	// Once `/proc` is mounted, we can set up the shutdown handler, which writes
-	// to `/proc/sysrq-trigger` to power off the system.
-	defer shutdown()
-
-	// mount -t devtmpfs -o nosuid,noexec devtmpfs /dev
-	if err := mount.Mount("devtmpfs", "/dev", "devtmpfs", "nosuid,noexec"); err != nil {
-		log.Printf("failed to mount: %v", err)
-	}
-	// mount -t sysfs -o nodev,nosuid,noexec sys /sys
-	if err := os.Mkdir("/sys", 0555); err != nil {
-		log.Printf("failed to create /sys: %v", err)
-	} else if err := mount.Mount("sys", "/sys", "sysfs", "nodev,nosuid,noexec"); err != nil {
-		log.Printf("failed to mount: %v", err)
-	}
-	// mount -t cgroup -o all cgroup /sys/fs/cgroup
-	if err := mount.Mount("cgroup", "/sys/fs/cgroup", "cgroup", "all"); err != nil {
-		log.Printf("failed to mount: %v", err)
-	}
-	// mount -t tmpfs -o nodev,nosuid,noexec tmpfs /tmp
-	if err := mount.Mount("tmpfs", "/tmp", "tmpfs", "nodev,nosuid,noexec"); err != nil {
-		log.Printf("failed to mount: %v", err)
-	}
-
+func run(ctx context.Context) error {
 	b, err := os.ReadFile("/etc/apko.json")
 	if err != nil {
-		log.Printf("failed to read /etc/apko.json: %v", err)
+		return fmt.Errorf("failed to read /etc/apko.json: %v", err)
 	}
 	var ic ImageConfiguration
 	if err := json.Unmarshal(b, &ic); err != nil {
-		log.Panicf("failed to unmarshal /etc/apko.json: %v", err)
+		return fmt.Errorf("failed to unmarshal /etc/apko.json: %v", err)
 	}
 
 	// Ensure path is set in the environment.
@@ -93,75 +63,11 @@ func main() {
 		ic.Environment["PATH"] = defaultPath
 	}
 
-	// TODO(mattmoor): Set up other important devices.
-
-	// Set up network interfaces for loopback and veth.
-	if lo, err := netlink.LinkByName("lo"); err != nil {
-		log.Panicf("failed to get lo: %v", err)
-	} else if err := netlink.LinkSetUp(lo); err != nil {
-		log.Panicf("failed to set lo up: %v", err)
-	}
-	// Find the 1st veth interface supporting broadcast and multi-cast
-	// that is up.
-	ll, err := netlink.LinkList()
-	if err != nil {
-		log.Panicf("failed to list links: %v", err)
-	}
-	var eth0 netlink.Link
-	for _, link := range ll {
-		// This is to mirror this:
-		// ip -o link show | grep '<BROADCAST,MULTICAST>'
-		attr := link.Attrs()
-		if attr.Flags&net.FlagBroadcast != net.FlagBroadcast {
-			continue
-		} else if attr.Flags&net.FlagMulticast != net.FlagMulticast {
-			continue
-		}
-		eth0 = link
-		break
-	}
-	skipNetworking := false
-	if eth0 == nil {
-		log.Printf("no suitable interface found to listen on, skipping networking")
-		skipNetworking = true
-	} else if err := netlink.LinkSetUp(eth0); err != nil {
-		log.Panicf("failed to set network interface %s up: %v", eth0.Attrs().Name, err)
-	}
-
-	// Configure DHCP for eth0
-	// Modeled after the u-root configureAll function:
-	// https://github.com/u-root/u-root/blob/0c0df672/cmds/core/dhclient/dhclient.go#L67
-	if !skipNetworking {
-		c := dhclient.Config{
-			Timeout: 10 * time.Second,
-			Retries: 3,
-			V4ServerAddr: &net.UDPAddr{
-				IP:   net.IPv4bcast,
-				Port: dhcpv4.ServerPort,
-			},
-			LogLevel: dhclient.LogInfo, // There is nothing lower than info.
-		}
-		r := dhclient.SendRequests(ctx, []netlink.Link{eth0},
-			true /* ipv4 */, false /* ipv6 */, c, 10*time.Second)
-		for result := range r {
-			if result.Err != nil {
-				log.Printf("Could not configure %s for %s: %v", result.Interface.Attrs().Name, result.Protocol, result.Err)
-				continue
-			}
-			if err := result.Lease.Configure(); err != nil {
-				log.Printf("Could not configure %s for %s: %v", result.Interface.Attrs().Name, result.Protocol, err)
-				continue
-			}
-			// log.Printf("Configured %s with %s", result.Interface.Attrs().Name, result.Lease)
-		}
-		log.Printf("Finished trying to configure all interfaces.")
-	}
-
 	// The command passed to exec.Command[Context] is resolved using this
 	// process's PATH, not the PATH passed to the command execution, so set our
 	// own PATH here.
 	if err := os.Setenv("PATH", ic.Environment["PATH"]); err != nil {
-		log.Panicf("failed to set PATH: %v", err)
+		return fmt.Errorf("failed to set PATH: %v", err)
 	}
 
 	// Split entrypoint and cmd and build up the args.
@@ -169,14 +75,14 @@ func main() {
 	if ic.Entrypoint.Command != "" {
 		splitep, err := shlex.Split(ic.Entrypoint.Command)
 		if err != nil {
-			log.Panicf("failed to split entrypoint: %v", err)
+			return fmt.Errorf("failed to split entrypoint: %v", err)
 		}
 		args = append(args, splitep...)
 	}
 	if ic.Cmd != "" {
 		splitcmd, err := shlex.Split(ic.Cmd)
 		if err != nil {
-			log.Panicf("failed to split command: %v", err)
+			return fmt.Errorf("failed to split command: %v", err)
 		}
 		args = append(args, splitcmd...)
 	}
@@ -214,7 +120,7 @@ func main() {
 		if uid == 0 && runAs != "root" {
 			uid, err = strconv.Atoi(ic.Accounts.RunAs)
 			if err != nil {
-				log.Panicf("failed to convert run-as user: %v", err)
+				return fmt.Errorf("failed to convert run-as user: %v", err)
 			}
 		}
 	}
@@ -227,7 +133,120 @@ func main() {
 
 	// Run the command, and wait for it to finish.
 	if err := cmd.Run(); err != nil {
-		log.Panicf("failed to run command: %v", err)
+		return fmt.Errorf("failed to run command: %v", err)
+	}
+	return nil
+}
+
+func runInit(ctx context.Context) error {
+	// mount -t proc proc -o nodev,nosuid,hidepid=2 /proc
+	if err := mount.Mount("proc", "/proc", "proc", "nodev,nosuid,hidepid=2"); err != nil {
+		log.Printf("failed to mount: %v", err)
+	}
+	// Once `/proc` is mounted, we can set up the shutdown handler, which writes
+	// to `/proc/sysrq-trigger` to power off the system.
+	defer shutdown()
+
+	// mount -t devtmpfs -o nosuid,noexec devtmpfs /dev
+	if err := mount.Mount("devtmpfs", "/dev", "devtmpfs", "nosuid,noexec"); err != nil {
+		log.Printf("failed to mount: %v", err)
+	}
+	// mount -t sysfs -o nodev,nosuid,noexec sys /sys
+	if err := os.Mkdir("/sys", 0555); err != nil {
+		log.Printf("failed to create /sys: %v", err)
+	} else if err := mount.Mount("sys", "/sys", "sysfs", "nodev,nosuid,noexec"); err != nil {
+		log.Printf("failed to mount: %v", err)
+	}
+	// mount -t cgroup -o all cgroup /sys/fs/cgroup
+	if err := mount.Mount("cgroup", "/sys/fs/cgroup", "cgroup", "all"); err != nil {
+		log.Printf("failed to mount: %v", err)
+	}
+	// mount -t tmpfs -o nodev,nosuid,noexec tmpfs /tmp
+	if err := mount.Mount("tmpfs", "/tmp", "tmpfs", "nodev,nosuid,noexec"); err != nil {
+		log.Printf("failed to mount: %v", err)
+	}
+
+	// TODO(mattmoor): Set up other important devices.
+
+	// Set up network interfaces for loopback and veth.
+	if lo, err := netlink.LinkByName("lo"); err != nil {
+		return fmt.Errorf("failed to get lo: %v", err)
+	} else if err := netlink.LinkSetUp(lo); err != nil {
+		return fmt.Errorf("failed to set lo up: %v", err)
+	}
+	// Find the 1st veth interface supporting broadcast and multi-cast
+	// that is up.
+	ll, err := netlink.LinkList()
+	if err != nil {
+		return fmt.Errorf("failed to list links: %v", err)
+	}
+	var eth0 netlink.Link
+	for _, link := range ll {
+		// This is to mirror this:
+		// ip -o link show | grep '<BROADCAST,MULTICAST>'
+		attr := link.Attrs()
+		if attr.Flags&net.FlagBroadcast != net.FlagBroadcast {
+			continue
+		} else if attr.Flags&net.FlagMulticast != net.FlagMulticast {
+			continue
+		}
+		eth0 = link
+		break
+	}
+	skipNetworking := false
+	if eth0 == nil {
+		log.Printf("no suitable interface found to listen on, skipping networking")
+		skipNetworking = true
+	} else if err := netlink.LinkSetUp(eth0); err != nil {
+		return fmt.Errorf("failed to set network interface %s up: %v", eth0.Attrs().Name, err)
+	}
+
+	// Configure DHCP for eth0
+	// Modeled after the u-root configureAll function:
+	// https://github.com/u-root/u-root/blob/0c0df672/cmds/core/dhclient/dhclient.go#L67
+	if !skipNetworking {
+		c := dhclient.Config{
+			Timeout: 10 * time.Second,
+			Retries: 3,
+			V4ServerAddr: &net.UDPAddr{
+				IP:   net.IPv4bcast,
+				Port: dhcpv4.ServerPort,
+			},
+			LogLevel: dhclient.LogInfo, // There is nothing lower than info.
+		}
+		r := dhclient.SendRequests(ctx, []netlink.Link{eth0},
+			true /* ipv4 */, false /* ipv6 */, c, 10*time.Second)
+		for result := range r {
+			if result.Err != nil {
+				log.Printf("Could not configure %s for %s: %v", result.Interface.Attrs().Name, result.Protocol, result.Err)
+				continue
+			}
+			if err := result.Lease.Configure(); err != nil {
+				log.Printf("Could not configure %s for %s: %v", result.Interface.Attrs().Name, result.Protocol, err)
+				continue
+			}
+			// log.Printf("Configured %s with %s", result.Interface.Attrs().Name, result.Lease)
+		}
+		log.Printf("Finished trying to configure all interfaces.")
+	}
+
+	return run(ctx)
+}
+
+func main() {
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+
+	// Check if the command was invoked as init
+	switch os.Args[0] {
+	case "/init", "/sbin/init":
+		if err := runInit(ctx); err != nil {
+			log.Panicf("failed to run: %v", err)
+		}
+	default:
+		if err := run(ctx); err != nil {
+			log.Panicf("failed to run: %v", err)
+		}
 	}
 }
 
