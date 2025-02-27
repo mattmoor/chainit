@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -117,6 +118,11 @@ func main() {
 		} else if attr.Flags&net.FlagMulticast != net.FlagMulticast {
 			continue
 		}
+		if strings.HasPrefix(link.Attrs().Name, "gretap") {
+			// skip gretap devices (generic routing encapsulation)
+			continue
+		}
+
 		eth0 = link
 		break
 	}
