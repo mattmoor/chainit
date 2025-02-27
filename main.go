@@ -62,7 +62,7 @@ func main() {
 		log.Printf("failed to mount: %v", err)
 	}
 	// mount -t sysfs -o nodev,nosuid,noexec sys /sys
-	if err := os.Mkdir("/sys", 0555); err != nil {
+	if err := os.MkdirAll("/sys", 0555); err != nil {
 		log.Printf("failed to create /sys: %v", err)
 	} else if err := mount.Mount("sys", "/sys", "sysfs", "nodev,nosuid,noexec"); err != nil {
 		log.Printf("failed to mount: %v", err)
