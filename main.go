@@ -44,6 +44,32 @@ func shutdown() {
 	select {}
 }
 
+func findLinks() []netlink.Link {
+	links := []netlink.Link{}
+	ll, err := netlink.LinkList()
+	if err != nil {
+		log.Panicf("failed to list links: %v", err)
+	}
+
+	for _, link := range ll {
+		// This is to mirror this:
+		// ip -o link show | grep '<BROADCAST,MULTICAST>'
+		attr := link.Attrs()
+		if attr.Flags&net.FlagBroadcast != net.FlagBroadcast {
+			continue
+		} else if attr.Flags&net.FlagMulticast != net.FlagMulticast {
+			continue
+		}
+		if strings.HasPrefix(link.Attrs().Name, "gretap") {
+			// skip gretap devices (generic routing encapsulation)
+			continue
+		}
+
+		links = append(links, link)
+	}
+	return links
+}
+
 const defaultPath = "/sbin:/usr/sbin:/bin:/usr/bin:/usr/local/sbin:/usr/local/bin"
 
 func main() {
@@ -57,6 +83,14 @@ func main() {
 	// Once `/proc` is mounted, we can set up the shutdown handler, which writes
 	// to `/proc/sysrq-trigger` to power off the system.
 	defer shutdown()
+
+	cmdline := ""
+	bbuf, err := os.ReadFile("/proc/cmdline")
+	if err != nil {
+		log.Printf("failed to read /proc/cmdline")
+	} else {
+		cmdline = string(bbuf)
+	}
 
 	// mount -t devtmpfs -o nosuid,noexec devtmpfs /dev
 	if err := mount.Mount("devtmpfs", "/dev", "devtmpfs", "nosuid,noexec"); err != nil {
@@ -104,40 +138,30 @@ func main() {
 	}
 	// Find the 1st veth interface supporting broadcast and multi-cast
 	// that is up.
-	ll, err := netlink.LinkList()
-	if err != nil {
-		log.Panicf("failed to list links: %v", err)
-	}
-	var eth0 netlink.Link
-	for _, link := range ll {
-		// This is to mirror this:
-		// ip -o link show | grep '<BROADCAST,MULTICAST>'
-		attr := link.Attrs()
-		if attr.Flags&net.FlagBroadcast != net.FlagBroadcast {
-			continue
-		} else if attr.Flags&net.FlagMulticast != net.FlagMulticast {
-			continue
-		}
-		if strings.HasPrefix(link.Attrs().Name, "gretap") {
-			// skip gretap devices (generic routing encapsulation)
-			continue
-		}
-
-		eth0 = link
-		break
-	}
 	skipNetworking := false
-	if eth0 == nil {
-		log.Printf("no suitable interface found to listen on, skipping networking")
+	if strings.Contains(cmdline, "chainit.network=false") {
 		skipNetworking = true
-	} else if err := netlink.LinkSetUp(eth0); err != nil {
-		log.Panicf("failed to set network interface %s up: %v", eth0.Attrs().Name, err)
+	}
+
+	links := []netlink.Link{}
+	if !skipNetworking {
+		links := findLinks()
+		if len(links) == 0 {
+			log.Printf("no suitable interface found to listen on, skipping networking")
+			skipNetworking = true
+		}
 	}
 
 	// Configure DHCP for eth0
 	// Modeled after the u-root configureAll function:
 	// https://github.com/u-root/u-root/blob/0c0df672/cmds/core/dhclient/dhclient.go#L67
-	if !skipNetworking {
+	if !skipNetworking && len(links) != 0 {
+		eth0 := links[0]
+		err := netlink.LinkSetUp(eth0)
+		if err != nil {
+			log.Panicf("failed to set network interface %s up: %v", eth0.Attrs().Name, err)
+		}
+
 		c := dhclient.Config{
 			Timeout: 10 * time.Second,
 			Retries: 3,
